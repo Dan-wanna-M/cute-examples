@@ -1,1 +1,1 @@
-# cute-examples
+# Cute Examples
