@@ -54,7 +54,7 @@ def create_test_tensors(shape, device='cuda', dtype=torch.bfloat16):
     """Create new test tensors for benchmarking."""
     A = torch.randn(shape[0], shape[1], device=device, dtype=dtype)
     B = torch.randn(shape[1], shape[0], device=device, dtype=dtype)
-    C = torch.empty((A.shape[0], B.shape[0]), device=device, dtype=dtype)
+    C = torch.empty((A.shape[0], B.shape[1]), device=device, dtype=dtype)
     bytes_per_element = torch.finfo(dtype).bits // 8
     l2_flush_size_elements = (80 * 1024 * 1024) // bytes_per_element
     D = torch.randn(l2_flush_size_elements, dtype=dtype, device=device)
@@ -86,24 +86,7 @@ def benchmark_torch_native_gemm(shape, num_runs=100, device='cuda', dtype=torch.
         
         if operation == 'mm':
             # Standard matrix multiplication: A @ B.T
-            torch.mm(A, B.t(), out=C)
-        elif operation == 'addmm':
-            # Additive matrix multiplication: C + A @ B.T
-            result = torch.addmm(C, A, B.t())
-        elif operation == 'bmm':
-            # Batch matrix multiplication (single batch)
-            A_batch = A.unsqueeze(0)
-            B_batch = B.t().unsqueeze(0)
-            result = torch.bmm(A_batch, B_batch).squeeze(0)
-        elif operation == 'baddbmm':
-            # Batch additive matrix multiplication
-            A_batch = A.unsqueeze(0)
-            B_batch = B.t().unsqueeze(0)
-            C_batch = C.unsqueeze(0)
-            result = torch.baddbmm(C_batch, A_batch, B_batch).squeeze(0)
-        elif operation == 'matmul':
-            # General matrix multiplication using @ operator
-            result = A @ B.t()
+            torch.mm(A, B, out=C)
         else:
             raise ValueError(f"Unknown operation: {operation}")
         
@@ -298,7 +281,7 @@ def benchmark_gemm_custom(shape, num_runs=100, device='cuda', dtype=torch.bfloat
     for _ in range(num_runs):
         # Create new tensors for each run
         A, B, C = create_test_tensors(shape, device, dtype)
-        
+        B = B.t().contiguous()
         torch.cuda.synchronize()
         start_time = time.perf_counter()
         
@@ -452,7 +435,7 @@ def benchmark_cublas_lt_bf16(shape, num_runs=100, device='cuda', dtype=torch.bfl
             torch.cuda.synchronize()
             start_time = time.perf_counter()
             
-            _ = torch.mm(A_test, B_test.t())
+            _ = torch.mm(A_test, B_test)
             
             torch.cuda.synchronize()
             end_time = time.perf_counter()
@@ -489,12 +472,11 @@ def benchmark_comparison(shape=(4096, 4096), num_warmup=10, num_runs=100, autotu
     print("Warming up all implementations...")
     for _ in range(num_warmup):
         A, B, C = create_test_tensors(shape, device, dtype)
-        
         # Warmup custom kernel
-        result = gemm_tn_test(A, B, C)
+        result = gemm_tn_test(A, B.t().contiguous(), C)
         
         # Warmup PyTorch native
-        result_torch = torch.mm(A, B.t())
+        result_torch = torch.mm(A, B)
         
         torch.cuda.synchronize()
     
@@ -634,8 +616,9 @@ def profile_different_shapes():
         (1024, 1024),
         (2048, 2048), 
         (4096, 4096),
+        (8192, 16384),
         (8192, 8192),
-        (16384, 16384),  # Large size for stress testing
+        (16384, 4096),  # Large size for stress testing
     ]
     
     results = []
