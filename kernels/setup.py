@@ -11,7 +11,7 @@ setup(
             "gemm_kernels._C",
             [
                 os.path.join("gemm_kernels","__init__.cpp"),
-                os.path.join("gemm_kernels","sm90a", "gemm_test.cu"),
+                os.path.join("gemm_kernels","sm90a", "debug_mbarrier.cu"),
             ],
             extra_compile_args={
                 "cxx": ["-O3", "-Wall", "-Wextra", "-pedantic", "-std=c++17"],

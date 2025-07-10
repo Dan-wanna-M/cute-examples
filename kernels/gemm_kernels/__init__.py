@@ -1,1 +1,1 @@
-from ._C import gemm_tn_test
+from ._C import debug_mbarrier
