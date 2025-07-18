@@ -21,26 +21,40 @@
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
 namespace test {
-template <int32_t pipeline_length> struct TmaLoadPipeline {
+template <typename TmaCopy, typename TmaCopyPerCta, int32_t pipeline_length>
+struct TmaLoadPipeline {
   using ProducerBarType = cutlass::arch::ClusterTransactionBarrier; // TMA
   using ConsumerBarType = cutlass::arch::ClusterBarrier;            // MMA
+  TmaCopy const *tma_load;
+  TmaCopyPerCta tma_copy_per_cta;
   uint64_t *producer_mbarriers;
   uint64_t *consumer_mbarriers;
-  cutlass::PipelineState<pipeline_length> pipeline_state;
+  uint16_t tma_mcast_mask;
+  cutlass::PipelineState<pipeline_length> producer_current_stage;
+  cutlass::PipelineState<pipeline_length> consumer_current_stage;
   // to make array happy
-  CUTE_DEVICE TmaLoadPipeline() : producer_mbarriers{}, consumer_mbarriers{} {};
+  CUTE_DEVICE TmaLoadPipeline()
+      : tma_load{}, tma_copy_per_cta{0}, producer_mbarriers{},
+        consumer_mbarriers{}, tma_mcast_mask{}, producer_current_stage{},
+        consumer_current_stage{} {};
   CUTE_DEVICE
-  TmaLoadPipeline(cute::array<uint64_t, pipeline_length> &producer_mbarriers,
+  TmaLoadPipeline(TmaCopy const &tma_load, TmaCopyPerCta tma_copy_per_cta,
+                  cute::array<uint64_t, pipeline_length> &producer_mbarriers,
                   cute::array<uint64_t, pipeline_length> &consumer_mbarriers,
-                  bool is_producer_warpgroup)
-      : producer_mbarriers(producer_mbarriers.data()),
+                  uint16_t tma_mcast_mask)
+      : tma_load(&tma_load), tma_copy_per_cta(tma_copy_per_cta),
+        producer_mbarriers(producer_mbarriers.data()),
         consumer_mbarriers(consumer_mbarriers.data()),
-        pipeline_state(0, (uint32_t)is_producer_warpgroup, 0) {};
+        producer_current_stage{0, 1, 0}, consumer_current_stage{},
+        tma_mcast_mask(tma_mcast_mask) {};
   CUTE_DEVICE
   TmaLoadPipeline(const TmaLoadPipeline &other)
-      : producer_mbarriers(other.producer_mbarriers),
+      : tma_load(other.tma_load), tma_copy_per_cta(other.tma_copy_per_cta),
+        producer_mbarriers(other.producer_mbarriers),
         consumer_mbarriers(other.consumer_mbarriers),
-        pipeline_state(other.pipeline_state) {}
+        tma_mcast_mask(other.tma_mcast_mask),
+        producer_current_stage(other.producer_current_stage),
+        consumer_current_stage(other.consumer_current_stage) {}
   // This function should be called by an appropriate leader thread in a CTA
   // and followed by appropriate fence and sync.
   CUTE_DEVICE void init_mbarriers(const uint32_t producer_thread_count,
@@ -53,87 +67,62 @@ template <int32_t pipeline_length> struct TmaLoadPipeline {
     }
   }
 
-  CUTE_DEVICE int32_t index() const { return pipeline_state.index(); }
-
   // Wait for the consumer to release the buffer.
   CUTE_DEVICE void producer_acquire() {
-    ConsumerBarType::wait(&consumer_mbarriers[pipeline_state.index()],
-                          pipeline_state.phase());
-  }
-  CUTE_DEVICE bool producer_try_acquire() {
-    return ConsumerBarType::try_wait(
-        &consumer_mbarriers[pipeline_state.index()], pipeline_state.phase());
+    ConsumerBarType::wait(&consumer_mbarriers[producer_current_stage.index()],
+                          producer_current_stage.phase());
   }
   // Signal that the producer starts committing a transaction.
   CUTE_DEVICE void producer_commit_start(const uint32_t transaction_bytes) {
     ProducerBarType::arrive_and_expect_tx(
-        &producer_mbarriers[pipeline_state.index()], transaction_bytes);
+        &producer_mbarriers[producer_current_stage.index()], transaction_bytes);
   }
   // Signal that the producer has finished committing a transaction.
-  CUTE_DEVICE void producer_commit_end() { ++pipeline_state; }
+  CUTE_DEVICE void producer_commit_end() { ++producer_current_stage; }
   // Wait for the producer to release the buffer.
   CUTE_DEVICE void consumer_acquire() {
-    ProducerBarType::wait(&producer_mbarriers[pipeline_state.index()],
-                          pipeline_state.phase());
-  }
-  CUTE_DEVICE bool consumer_try_acquire() {
-    return ProducerBarType::try_wait(
-        &producer_mbarriers[pipeline_state.index()], pipeline_state.phase());
+    ProducerBarType::wait(&producer_mbarriers[consumer_current_stage.index()],
+                          consumer_current_stage.phase());
   }
   // Signal that the consumer committed a transaction for local cta.
   CUTE_DEVICE void consumer_cta_commit() {
-    ConsumerBarType::arrive(&consumer_mbarriers[pipeline_state.index()]);
-    ++pipeline_state;
+    ConsumerBarType::arrive(
+        &consumer_mbarriers[consumer_current_stage.index()]);
+    ++consumer_current_stage;
   }
   // Signal that the consumer committed a transaction for both local and remote
   // cta.
   CUTE_DEVICE void consumer_cluster_commit() {
     const uint32_t cta_rank_in_cluster = cute::block_rank_in_cluster();
-    ConsumerBarType::arrive(&consumer_mbarriers[pipeline_state.index()]);
-    ConsumerBarType::arrive(&consumer_mbarriers[pipeline_state.index()],
+    ConsumerBarType::arrive(
+        &consumer_mbarriers[consumer_current_stage.index()]);
+    ConsumerBarType::arrive(&consumer_mbarriers[consumer_current_stage.index()],
                             cta_rank_in_cluster ^ 1, // peer cta id
                             1);
-    ++pipeline_state;
+    ++consumer_current_stage;
   }
-};
-template <typename TmaCopy, typename TmaCopyPerCta, int32_t pipeline_length>
-struct TmaLoad {
-  TmaCopy const *tma_load;
-  TmaCopyPerCta tma_copy_per_cta;
-  TmaLoadPipeline<pipeline_length>* pipeline;
-  uint16_t tma_mcast_mask;
-  // to make array happy
-  CUTE_DEVICE TmaLoad()
-      : tma_load{}, tma_copy_per_cta{0}, pipeline{}, tma_mcast_mask{} {};
-  CUTE_DEVICE
-  TmaLoad(TmaCopy const &tma_load, TmaCopyPerCta tma_copy_per_cta,
-          TmaLoadPipeline<pipeline_length>& pipeline, uint16_t tma_mcast_mask)
-      : tma_load(&tma_load), tma_copy_per_cta(tma_copy_per_cta),
-        pipeline(&pipeline), tma_mcast_mask(tma_mcast_mask) {};
-  CUTE_DEVICE
-  TmaLoad(const TmaLoad &other)
-      : tma_load(other.tma_load), tma_copy_per_cta(other.tma_copy_per_cta),
-        pipeline(other.pipeline), tma_mcast_mask(other.tma_mcast_mask) {}
   // Issue a copy from global memory to shared memory.
   template <typename GmemTensor, typename SmemTensor>
   CUTE_DEVICE void issue_copy(const GmemTensor &gmem_tensor,
                               SmemTensor &&smem_tensor) {
-    cute::copy(tma_load->with(pipeline->producer_mbarriers[pipeline->index()],
-                              tma_mcast_mask),
-               tma_copy_per_cta.partition_S(gmem_tensor),
-               tma_copy_per_cta.partition_D(smem_tensor));
+    cute::copy(
+        tma_load->with(producer_mbarriers[consumer_current_stage.index()],
+                       tma_mcast_mask),
+        tma_copy_per_cta.partition_S(gmem_tensor),
+        tma_copy_per_cta.partition_D(smem_tensor));
   };
 };
-template <typename TTmaLoad, int32_t pipeline_length>
-CUTE_DEVICE decltype(auto)
-make_tma_load(const TTmaLoad &tma_load,
-              TmaLoadPipeline<pipeline_length>& pipeline,
-              uint16_t tma_mcast_mask) {
-  auto tma_copy_per_cta = tma_load.get_slice(
-      cute::block_rank_in_cluster()); // Get the TMA copy for this CTA
-  return TmaLoad<TTmaLoad, decltype(tma_copy_per_cta), pipeline_length>(
-      tma_load, tma_copy_per_cta, pipeline, tma_mcast_mask);
-}
+template <typename TmaCopy, int32_t pipeline_length>
+CUTE_DEVICE decltype(auto) make_tma_load_pipeline(
+    TmaCopy const &tma_load,
+    cute::array<uint64_t, pipeline_length> &producer_mbarriers,
+    cute::array<uint64_t, pipeline_length> &consumer_mbarriers,
+    uint16_t tma_mcast_mask, uint32_t cta_rank_in_cluster) {
+  auto tma_copy_per_cta = tma_load.get_slice(cta_rank_in_cluster);
+  return TmaLoadPipeline<TmaCopy, decltype(tma_copy_per_cta), pipeline_length>(
+      tma_load, tma_copy_per_cta, producer_mbarriers, consumer_mbarriers,
+      tma_mcast_mask);
+};
 // Assume aligned block size
 template <typename Config> struct Gemm {
   constexpr static int32_t cluster_size =
@@ -297,19 +286,15 @@ template <typename Config> struct Gemm {
       // Make sure barriers on shared memory are visible to another CTA
       cutlass::arch::fence_barrier_init();
     }
-    auto pipeline = TmaLoadPipeline<pipe_length>{
-        smem.tma_barrier, smem.mma_barrier,
-        warpgroup_idx == static_cast<int>(WarpgroupRole::Producer)};
-    auto tma_load_a = make_tma_load<TmaA, typename Config::bP{}>(
-        tma_a, pipeline, 0b11);
-    auto tma_load_b = make_tma_load<TmaB, typename Config::bP{}>(
-        tma_b, pipeline, 0b11);
+    const uint32_t cta_rank_in_cluster = cute::block_rank_in_cluster();
+    auto pipeline_A = make_tma_load_pipeline<TmaA, pipe_length>(
+        tma_a, smem.tma_barrier, smem.mma_barrier, 0b11, cta_rank_in_cluster);
+    auto pipeline_B = make_tma_load_pipeline<TmaB, pipe_length>(
+        tma_b, smem.tma_barrier, smem.mma_barrier, 0b11, cta_rank_in_cluster);
     // Wait for all CTAs to initialize barriers
     cute::cluster_sync();
     uint32_t m_block_idx = 0;
     uint32_t n_block_idx = 0;
-
-    const uint32_t cta_rank_in_cluster = cute::block_rank_in_cluster();
     while (tile_scheduler.get_next_block(m_block_idx, n_block_idx)) {
       auto cta_coord = cute::make_coord(m_block_idx, n_block_idx,
                                         cute::_); // (m,n,k)
@@ -377,8 +362,12 @@ template <typename Config> struct Gemm {
              computed_k_tile_idx < cute::size<2>(gmem_A_tile);
              ++computed_k_tile_idx) {
           // Wait for Producer to complete
-          int pipe = pipeline.index();
-          pipeline.consumer_acquire();
+          int pipe = pipeline_A.consumer_current_stage.index();
+          if(thread_id_within_warpgroup == 0) {
+            printf("Warpgroup %d, pipe %d, computed_k_tile_idx %d\n",
+                   warpgroup_idx, pipe, computed_k_tile_idx);
+          }
+          pipeline_A.consumer_acquire();
           // MMAs to cover 1 K_TILE
           cute::warpgroup_arrive();
           cute::gemm(mma,
@@ -389,7 +378,7 @@ template <typename Config> struct Gemm {
           // Wait for all MMAs in a K_TILE to complete
           cute::warpgroup_wait<0>();
           // Notify that consumption is done
-          pipeline.consumer_cluster_commit();
+          pipeline_A.consumer_cluster_commit();
         }
         auto rmem_C_per_thread_x2 =
             cute::recast<cutlass::Array<float, 2>>(rmem_C_per_thread);
@@ -429,22 +418,24 @@ template <typename Config> struct Gemm {
           for (int32_t loaded_k_tile_idx = 0;
                loaded_k_tile_idx < cute::size<2>(gmem_A_tile);
                ++loaded_k_tile_idx) {
-            auto pipe = pipeline.index();
+            auto pipe = pipeline_A.producer_current_stage.index();
             // Wait for the current warpgroup to finish
-            pipeline.producer_acquire();
-            pipeline.producer_commit_start(transaction_bytes);
-            tma_load_a.issue_copy(divided_gmem_A_tile(cute::_, cute::_0{},
+            pipeline_A.producer_acquire();
+            pipeline_A.producer_commit_start(transaction_bytes);
+            pipeline_A.issue_copy(divided_gmem_A_tile(cute::_, cute::_0{},
                                                       cute::_,
                                                       loaded_k_tile_idx),
                                   smem_A1_tile(cute::_, cute::_, pipe));
-            tma_load_a.issue_copy(divided_gmem_A_tile(cute::_, cute::_1{},
+            pipeline_A.issue_copy(divided_gmem_A_tile(cute::_, cute::_1{},
                                                       cute::_,
                                                       loaded_k_tile_idx),
                                   smem_A2_tile(cute::_, cute::_, pipe));
-            tma_load_b.issue_copy(
+            // pipeline B shares mbarrier with pipeline A, so we do not need to
+            // advance pipeline_B. We just need to issue the copy.
+            pipeline_B.issue_copy(
                 gmem_B_tile(cute::_, cute::_, loaded_k_tile_idx),
                 smem_B_tile(cute::_, cute::_, pipe));
-            pipeline.producer_commit_end();
+            pipeline_A.producer_commit_end();
           }
         }
       }
