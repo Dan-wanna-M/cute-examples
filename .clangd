@@ -2,9 +2,9 @@ CompileFlags:
   Add: [
     "-I.", 
     "-I/usr/include/python3.12/",
-    "-I/workspace/VideoTitans/.venv/lib/python3.12/site-packages/torch/include",
-    "-I/workspace/VideoTitans/libs/cutlass/include",
-    "-I/workspace/VideoTitans/.venv/lib/python3.12/site-packages/torch/include/torch/csrc/api/include/",
+    "-I/workspace/cute-examples/.venv/lib/python3.12/site-packages/torch/include",
+    "-I/workspace/cute-examples/libs/cutlass/include",
+    "-I/workspace/cute-examples/.venv/lib/python3.12/site-packages/torch/include/torch/csrc/api/include/",
     "-xcuda",
     "-Wall",
     "-Wextra",

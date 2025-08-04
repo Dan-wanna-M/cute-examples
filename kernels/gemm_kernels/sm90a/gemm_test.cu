@@ -9,7 +9,8 @@
 #include <torch/extension.h>
 #include <torch/torch.h>
 namespace test {
-torch::Tensor gemm_tn_test(const torch::Tensor A, const torch::Tensor B, torch::Tensor C) {
+torch::Tensor gemm_tn_test(const torch::Tensor A, const torch::Tensor B,
+                           torch::Tensor C) {
   // Ensure the tensors are on the same device
   TORCH_CHECK(A.device() == B.device(),
               "All tensors must be on the same device");
@@ -52,26 +53,24 @@ torch::Tensor gemm_tn_test(const torch::Tensor A, const torch::Tensor B, torch::
   cute::Tensor mC = cute::make_tensor(
       cute::make_gmem_ptr<cute::bfloat16_t>(C.mutable_data_ptr()),
       cute::make_shape(M, N), C_stride);
-  auto warpgroup_tiler =
-      cute::Shape<typename DefaultConfig::half_bM, typename DefaultConfig::bN,
-                  typename DefaultConfig::bK>{};
   auto cluster_shape = cute::Shape<cute::_2, cute::_1, cute::_1>{};
+  auto cta_tiler = typename DefaultConfig::CtaTiler{};
   cute::TiledCopy tma_A = cute::make_tma_copy_A_sm90(
       cute::SM90_TMA_LOAD{}, mA,
-      typename DefaultConfig::SmemLayoutA{}(cute::_, cute::_, 0),
-      warpgroup_tiler, cluster_shape);
+      typename DefaultConfig::SmemLayoutA{}(cute::_, cute::_, 0), cta_tiler,
+      cluster_shape);
   cute::TiledCopy tma_B = cute::make_tma_copy_B_sm90(
       cute::SM90_TMA_LOAD_MULTICAST{}, mB,
-      typename DefaultConfig::SmemLayoutB{}(cute::_, cute::_, 0),
-      warpgroup_tiler, cluster_shape);
+      typename DefaultConfig::SmemLayoutB{}(cute::_, cute::_, 0), cta_tiler,
+      cluster_shape);
   cute::TiledCopy tma_C = cute::make_tma_copy_C_sm90(
       cute::SM90_TMA_STORE{}, mC, typename DefaultConfig::SmemLayoutC{},
-      warpgroup_tiler);
+      cta_tiler);
   // Launch parameter setup
   dim3 dimBlock(test::Gemm<DefaultConfig>::threads_per_block);
   dim3 dimCluster(2, 1, 1);
-  dim3 dimGrid(std::min(132, (M / (2 * DefaultConfig::bM::value)) * N /
-                                 DefaultConfig::bN::value));
+  dim3 dimGrid(std::min(132, (M / DefaultConfig::bM::value * N /
+                                 DefaultConfig::bN::value)));
   int smemBytes = sizeof(Gemm<DefaultConfig>::SharedStorage);
   auto *kernel_ptr = gemm_kernel<DefaultConfig, decltype(tma_A),
                                  decltype(tma_B), decltype(tma_C)>;

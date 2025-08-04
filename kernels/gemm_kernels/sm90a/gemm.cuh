@@ -21,6 +21,22 @@
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
 namespace test {
+template <class TiledMMA, class AEngine, class ALayout, class BEngine,
+          class BLayout, class CEngine, class CLayout>
+CUTE_DEVICE void gemm_overwrite_C(TiledMMA &mma,
+                                  cute::Tensor<AEngine, ALayout> const &A,
+                                  cute::Tensor<BEngine, BLayout> const &B,
+                                  cute::Tensor<CEngine, CLayout> &C) {
+  cute::warpgroup_arrive();
+  mma.accumulate_ = decltype(mma.accumulate_)::Zero;
+  CUTE_UNROLL
+  for (int k_block_idx = 0; k_block_idx < cute::size<2>(A); k_block_idx++) {
+    cute::gemm(mma, A(cute::_, cute::_, k_block_idx),
+               B(cute::_, cute::_, k_block_idx), C);
+    mma.accumulate_ = decltype(mma.accumulate_)::One;
+  }
+  cute::warpgroup_commit_batch();
+}
 template <int32_t pipeline_length> struct TmaLoadPipeline {
   using ProducerBarType = cutlass::arch::ClusterTransactionBarrier; // TMA
   using ConsumerBarType = cutlass::arch::ClusterBarrier;            // MMA
@@ -100,14 +116,14 @@ template <typename TmaCopy, typename TmaCopyPerCta, int32_t pipeline_length>
 struct TmaLoad {
   TmaCopy const *tma_load;
   TmaCopyPerCta tma_copy_per_cta;
-  TmaLoadPipeline<pipeline_length>* pipeline;
+  TmaLoadPipeline<pipeline_length> *pipeline;
   uint16_t tma_mcast_mask;
   // to make array happy
   CUTE_DEVICE TmaLoad()
       : tma_load{}, tma_copy_per_cta{0}, pipeline{}, tma_mcast_mask{} {};
   CUTE_DEVICE
   TmaLoad(TmaCopy const &tma_load, TmaCopyPerCta tma_copy_per_cta,
-          TmaLoadPipeline<pipeline_length>& pipeline, uint16_t tma_mcast_mask)
+          TmaLoadPipeline<pipeline_length> &pipeline, uint16_t tma_mcast_mask)
       : tma_load(&tma_load), tma_copy_per_cta(tma_copy_per_cta),
         pipeline(&pipeline), tma_mcast_mask(tma_mcast_mask) {};
   CUTE_DEVICE
@@ -127,7 +143,7 @@ struct TmaLoad {
 template <typename TTmaLoad, int32_t pipeline_length>
 CUTE_DEVICE decltype(auto)
 make_tma_load(const TTmaLoad &tma_load,
-              TmaLoadPipeline<pipeline_length>& pipeline,
+              TmaLoadPipeline<pipeline_length> &pipeline,
               uint16_t tma_mcast_mask) {
   auto tma_copy_per_cta = tma_load.get_slice(
       cute::block_rank_in_cluster()); // Get the TMA copy for this CTA
@@ -197,21 +213,14 @@ template <typename Config> struct Gemm {
   struct SharedStorage {
     alignas(1024) cute::ArrayEngine<
         typename Config::TA,
-        cute::cosize_v<typename Config::SmemLayoutA>> A1; // (M/2,K,P)
-    alignas(1024) cute::ArrayEngine<
-        typename Config::TA,
-        cute::cosize_v<typename Config::SmemLayoutA>> A2; // (M/2,K,P)
-    // A1 and A2 are used by two consumer warpgroups
+        cute::cosize_v<typename Config::SmemLayoutA>> A; // (M,K,P)
     alignas(1024) cute::ArrayEngine<
         typename Config::TB,
         cute::cosize_v<typename Config::SmemLayoutB>> B; // (N,K,P)
     alignas(1024) cute::ArrayEngine<
         typename Config::TC,
-        cute::cosize_v<typename Config::SmemLayoutC>> C1; // (M,N,P)
-    alignas(1024) cute::ArrayEngine<
-        typename Config::TC,
-        cute::cosize_v<typename Config::SmemLayoutC>> C2; // (M,N,P)
-    // C1 and C2 are used by two consumer warpgroups
+        cute::cosize_v<typename Config::SmemLayoutC>> C; // (M,N,P)
+    // C is used by two consumer warpgroups
     // pipeline sized barriers
     cute::array<uint64_t, cute::size<2>(typename Config::SmemLayoutA{})>
         tma_barrier;
@@ -260,22 +269,16 @@ template <typename Config> struct Gemm {
     cute::Tensor gmem_C = tma_c.get_tma_tensor(cute::make_shape(M, N));
     constexpr auto pipe_length = cute::size<2>(typename Config::SmemLayoutA{});
     SharedStorage &smem = *reinterpret_cast<SharedStorage *>(shared_memory);
-    cute::Tensor smem_A1_tile = cute::make_tensor(
-        cute::make_smem_ptr(smem.A1.begin()),
-        typename Config::SmemLayoutA{}); // (BLK_M/2,BLK_K,PIPE)
-    cute::Tensor smem_A2_tile = cute::make_tensor(
-        cute::make_smem_ptr(smem.A2.begin()),
-        typename Config::SmemLayoutA{}); // (BLK_M/2,BLK_K,PIPE)
+    cute::Tensor smem_A_tile =
+        cute::make_tensor(cute::make_smem_ptr(smem.A.begin()),
+                          typename Config::SmemLayoutA{}); // (BLK_M,BLK_K,PIPE)
     // smem_A1_tile and smem_A2_tile are used
     cute::Tensor smem_B_tile =
         cute::make_tensor(cute::make_smem_ptr(smem.B.begin()),
                           typename Config::SmemLayoutB{}); // (BLK_N,BLK_K,PIPE)
-    cute::Tensor smem_C1_tile =
-        cute::make_tensor(cute::make_smem_ptr(smem.C1.begin()),
-                          typename Config::SmemLayoutC{}); // (BLK_M/2,BLK_N)
-    cute::Tensor smem_C2_tile =
-        cute::make_tensor(cute::make_smem_ptr(smem.C2.begin()),
-                          typename Config::SmemLayoutC{}); // (BLK_M/2,BLK_N)
+    cute::Tensor smem_C_tile =
+        cute::make_tensor(cute::make_smem_ptr(smem.C.begin()),
+                          typename Config::SmemLayoutC{}); // (BLK_M,BLK_N)
     // Initialize Barriers
     const auto lane_predicate = cute::elect_one_sync();
     auto &producer_mbar = smem.tma_barrier;
@@ -300,15 +303,14 @@ template <typename Config> struct Gemm {
     auto pipeline = TmaLoadPipeline<pipe_length>{
         smem.tma_barrier, smem.mma_barrier,
         warpgroup_idx == static_cast<int>(WarpgroupRole::Producer)};
-    auto tma_load_a = make_tma_load<TmaA, typename Config::bP{}>(
-        tma_a, pipeline, 0b11);
-    auto tma_load_b = make_tma_load<TmaB, typename Config::bP{}>(
-        tma_b, pipeline, 0b11);
+    auto tma_load_a =
+        make_tma_load<TmaA, typename Config::bP{}>(tma_a, pipeline, 0b11);
+    auto tma_load_b =
+        make_tma_load<TmaB, typename Config::bP{}>(tma_b, pipeline, 0b11);
     // Wait for all CTAs to initialize barriers
     cute::cluster_sync();
     uint32_t m_block_idx = 0;
     uint32_t n_block_idx = 0;
-
     const uint32_t cta_rank_in_cluster = cute::block_rank_in_cluster();
     while (tile_scheduler.get_next_block(m_block_idx, n_block_idx)) {
       auto cta_coord = cute::make_coord(m_block_idx, n_block_idx,
@@ -329,49 +331,24 @@ template <typename Config> struct Gemm {
       // half of the tile. The other tile is distinct for each CTA in the
       // cluster so each CTA must issue the TMA to copy its own, full tile.
       static_assert(!Config::kIsTMAMulticastOnA);
-      auto divided_gmem_A_tile =
-          cute::flat_divide(gmem_A_tile, cute::Shape<cute::Int<blockM / 2>>{});
       if (warpgroup_idx != static_cast<int>(WarpgroupRole::Producer)) {
         cutlass::arch::warpgroup_reg_alloc<ConsumerRegisters>();
         auto tma_c_per_cta = tma_c.get_slice(cta_rank_in_cluster);
-        auto thread_id_within_warpgroup =
-            threadIdx.x - warpgroup_idx * warpgroup_size; // [0,warpgroup_size)
-        // This is actually "get warpgroup slice"
-        cute::ThrMMA thr_mma = mma.get_thread_slice(thread_id_within_warpgroup);
+        auto thread_id_within_group =
+            threadIdx.x - static_cast<int32_t>(WarpgroupRole::Consumer1) *
+                              warpgroup_size; // [0,warpgroup_size)
+        cute::ThrMMA thr_mma = mma.get_thread_slice(thread_id_within_group);
         cute::Tensor gmem_C_tile = cute::local_tile(
             gmem_C, cta_tiler, cta_coord,
             cute::Step<cute::_1, cute::_1, cute::X>{}); // (BLK_M,BLK_N,k)
-        cute::Tensor divided_gmem_C_tile = cute::flat_divide(
-            gmem_C_tile, cute::Shape<cute::Int<blockM / 2>>{});
-        cute::Tensor gmem_C1_tile = divided_gmem_C_tile(
-            cute::_, cute::Int<0>{}, cute::_); // (BLK_M/2,BLK_N)
-        cute::Tensor gmem_C2_tile = divided_gmem_C_tile(
-            cute::_, cute::Int<1>{}, cute::_); // (BLK_M/2,BLK_N)
-        // Do not modify this. Any change will spill registers.
-        cute::Tensor smem_B_per_thread =
-            thr_mma.partition_B(smem_B_tile); // (MMA,MMA_N,MMA_K,PIPE)
-        decltype(thr_mma.partition_A(
-            smem_A1_tile)) smem_A_per_thread; // (MMA,MMA_M,MMA_K,PIPE)
-        decltype(smem_C1_tile) smem_C_tile;
-        decltype(gmem_C1_tile) current_gmem_C_tile;
-        if (warpgroup_idx == static_cast<uint32_t>(WarpgroupRole::Consumer1)) {
-          smem_A_per_thread = thr_mma.partition_A(smem_A1_tile);
-          smem_C_tile = smem_C1_tile;
-          current_gmem_C_tile = gmem_C1_tile;
-        } else {
-          smem_A_per_thread = thr_mma.partition_A(smem_A2_tile);
-          smem_C_tile = smem_C2_tile;
-          current_gmem_C_tile = gmem_C2_tile;
-        }
-        // Allocate accumulators and clear them
+        // Allocate "fragments"
+        cute::Tensor descriptor_A_per_thread =
+            thr_mma.partition_fragment_A(smem_A_tile); // (MMA,MMA_M,MMA_K,PIPE)
+        cute::Tensor descriptor_B_per_thread =
+            thr_mma.partition_fragment_B(smem_B_tile); // (MMA,MMA_N,MMA_K,PIPE)
+        // Allocate accumulators
         cute::Tensor rmem_C_per_thread =
             thr_mma.partition_fragment_C(smem_C_tile); // (MMA,MMA_M,MMA_N)
-        cute::clear(rmem_C_per_thread);
-        // Allocate "fragments"
-        cute::Tensor descriptor_A_per_thread = thr_mma.make_fragment_A(
-            smem_A_per_thread); // (MMA,MMA_M,MMA_K,PIPE)
-        cute::Tensor descriptor_B_per_thread = thr_mma.make_fragment_B(
-            smem_B_per_thread); // (MMA,MMA_N,MMA_K,PIPE)
         CUTE_NO_UNROLL
         for (int32_t computed_k_tile_idx = 0;
              computed_k_tile_idx < cute::size<2>(gmem_A_tile);
@@ -380,12 +357,9 @@ template <typename Config> struct Gemm {
           int pipe = pipeline.index();
           pipeline.consumer_acquire();
           // MMAs to cover 1 K_TILE
-          cute::warpgroup_arrive();
-          cute::gemm(mma,
-                     descriptor_A_per_thread(cute::_, cute::_, cute::_, pipe),
-                     descriptor_B_per_thread(cute::_, cute::_, cute::_, pipe),
-                     rmem_C_per_thread); // (V,M) x (V,N) => (V,M,N)
-          cute::warpgroup_commit_batch();
+          gemm(mma, descriptor_A_per_thread(cute::_, cute::_, cute::_, pipe),
+               descriptor_B_per_thread(cute::_, cute::_, cute::_, pipe),
+               rmem_C_per_thread); // (V,M) x (V,N) => (V,M,N)
           // Wait for all MMAs in a K_TILE to complete
           cute::warpgroup_wait<0>();
           // Notify that consumption is done
@@ -402,23 +376,20 @@ template <typename Config> struct Gemm {
                         cutlass::NumericArrayConverter<typename Config::TC,
                                                        float, 2>::convert);
         auto tiled_copy = typename Config::R2SCopy{};
-        auto thread_copy =
-            tiled_copy.get_thread_slice(thread_id_within_warpgroup);
+        auto thread_copy = tiled_copy.get_thread_slice(thread_id_within_group);
         auto rmem_C_per_thread_copy_view =
             thread_copy.retile_D(downcasted_rmem_C);
         auto smem_C_per_thread_copy_view = thread_copy.partition_D(smem_C_tile);
         // Wait last TMA store
         cute::tma_store_wait<0>();
-        cutlass::arch::NamedBarrier::arrive_and_wait(warpgroup_size,
-                                                     warpgroup_idx);
+        cutlass::arch::NamedBarrier::arrive_and_wait(warpgroup_size, 0);
         cute::copy(tiled_copy, rmem_C_per_thread_copy_view,
                    smem_C_per_thread_copy_view);
         cutlass::tma_store_fence();
-        cutlass::arch::NamedBarrier::arrive_and_wait(warpgroup_size,
-                                                     warpgroup_idx);
-        if (thread_id_within_warpgroup == 0) {
+        cutlass::arch::NamedBarrier::arrive_and_wait(warpgroup_size, 0);
+        if (thread_id_within_group == 0) {
           cute::copy(tma_c, tma_c_per_cta.partition_D(smem_C_tile),
-                     tma_c_per_cta.partition_D(current_gmem_C_tile));
+                     tma_c_per_cta.partition_D(gmem_C_tile));
           cute::tma_store_arrive();
         }
         __syncwarp();
@@ -433,14 +404,9 @@ template <typename Config> struct Gemm {
             // Wait for the current warpgroup to finish
             pipeline.producer_acquire();
             pipeline.producer_commit_start(transaction_bytes);
-            tma_load_a.issue_copy(divided_gmem_A_tile(cute::_, cute::_0{},
-                                                      cute::_,
-                                                      loaded_k_tile_idx),
-                                  smem_A1_tile(cute::_, cute::_, pipe));
-            tma_load_a.issue_copy(divided_gmem_A_tile(cute::_, cute::_1{},
-                                                      cute::_,
-                                                      loaded_k_tile_idx),
-                                  smem_A2_tile(cute::_, cute::_, pipe));
+            tma_load_a.issue_copy(
+                gmem_A_tile(cute::_, cute::_, loaded_k_tile_idx),
+                smem_A_tile(cute::_, cute::_, pipe));
             tma_load_b.issue_copy(
                 gmem_B_tile(cute::_, cute::_, loaded_k_tile_idx),
                 smem_B_tile(cute::_, cute::_, pipe));
@@ -453,7 +419,6 @@ template <typename Config> struct Gemm {
 };
 struct DefaultConfig {
   using bM = cute::Int<128>;
-  using half_bM = cute::Int<bM::value / 2>;
   using bN = cute::Int<256>;
   using bK = cute::Int<64>;
   using bP = cute::Int<3>;
@@ -466,17 +431,18 @@ struct DefaultConfig {
   // for each warpgroup
   using SmemLayoutA = decltype(cute::tile_to_shape(
       cute::GMMA::Layout_K_SW128_Atom<cute::bfloat16_t>{},
-      cute::make_shape(half_bM{}, bK{}, bP{})));
+      cute::make_shape(bM{}, bK{}, bP{})));
   using SmemLayoutB = decltype(cute::tile_to_shape(
       cute::GMMA::Layout_K_SW128_Atom<cute::bfloat16_t>{},
       cute::make_shape(bN{}, bK{}, bP{})));
   using SmemLayoutC = decltype(cute::tile_to_shape(
       cute::GMMA::Layout_K_SW128_Atom<cute::bfloat16_t>{},
-      cute::make_shape(half_bM{}, bN{}))); // no pipe
+      cute::make_shape(bM{}, bN{}))); // no pipe
   using TiledMma = decltype(cute::make_tiled_mma(
       cute::MMA_Atom<
           cute::MMA_Traits<cute::SM90::GMMA::MMA_64x256x16_F32BF16BF16_SS<
-              cute::GMMA::Major::K, cute::GMMA::Major::K>>>{}));
+              cute::GMMA::Major::K, cute::GMMA::Major::K>>>{},
+      cute::Layout<cute::Shape<cute::_2, cute::_1, cute::_1>>{}));
   using R2SCopyAtom =
       cute::Copy_Atom<cute::SM90_U32x4_STSM_N, cute::bfloat16_t>;
   using R2SCopy = decltype(cute::make_tiled_copy_C(R2SCopyAtom{}, TiledMma{}));
