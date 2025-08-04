@@ -472,8 +472,7 @@ struct DefaultConfig {
       cute::make_shape(bN{}, bK{}, bP{})));
   using SmemLayoutC = decltype(cute::tile_to_shape(
       cute::GMMA::Layout_K_SW128_Atom<cute::bfloat16_t>{},
-      cute::make_shape(half_bM{}, bN{}),
-      cute::Step<cute::_2, cute::_1>{})); // no pipe
+      cute::make_shape(half_bM{}, bN{}))); // no pipe
   using TiledMma = decltype(cute::make_tiled_mma(
       cute::MMA_Atom<
           cute::MMA_Traits<cute::SM90::GMMA::MMA_64x256x16_F32BF16BF16_SS<

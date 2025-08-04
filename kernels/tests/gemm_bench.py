@@ -482,8 +482,9 @@ def benchmark_comparison(shape=(4096, 4096), num_warmup=10, num_runs=100, autotu
     
     # Benchmark custom kernel
     print("Benchmarking custom GEMM...")
+    time.sleep(2.0)
     custom_time = benchmark_gemm_custom(shape, num_runs, device, dtype)
-    
+    time.sleep(2.0)
     # Benchmark PyTorch native GEMM variants
     print("\nBenchmarking PyTorch native GEMM...")
     torch_results = benchmark_torch_native_variants(shape, num_runs, device, dtype)
@@ -625,7 +626,7 @@ def profile_different_shapes():
     for shape in shapes:
         print(f"\nTesting shape: {shape}")
         try:
-            result = benchmark_comparison(shape=shape, num_warmup=2, num_runs=2000, autotune_cublas=True)
+            result = benchmark_comparison(shape=shape, num_warmup=5, num_runs=100, autotune_cublas=True)
             results.append((shape, result))
         except Exception as e:
             print(f"Failed to benchmark shape {shape}: {e}")
